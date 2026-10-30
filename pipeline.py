@@ -133,27 +133,36 @@ def pick_models(key):
 
 
 def llm_json(prompt, key, models):
-    """Ask the LLM for JSON; falls back across models and with/without JSON mode."""
+    """Ask the LLM for JSON; falls back across models and request styles.
+
+    Reasoning models (gpt-oss, qwen3) can spend the whole token budget thinking and return an
+    empty answer, so we ask for low reasoning effort and a large completion budget first.
+    """
     import requests
     last = ""
     for attempt in range(3):
         for model in models:
-            for json_mode in (True, False):
+            extras = {"max_completion_tokens": 8000}
+            if model.startswith("openai/gpt-oss"):
+                extras["reasoning_effort"] = "low"
+            variants = [(True, extras), (False, extras), (False, {})]
+            for json_mode, extra in variants:
                 body = {"model": model, "temperature": 0.3,
-                        "messages": [{"role": "user", "content": prompt}]}
+                        "messages": [{"role": "user", "content": prompt}], **extra}
                 if json_mode:
                     body["response_format"] = {"type": "json_object"}
                 r = requests.post(f"{GROQ}/chat/completions",
                                   headers={"Authorization": f"Bearer {key}"},
                                   json=body, timeout=180)
                 if r.status_code == 200:
-                    text = r.json()["choices"][0]["message"].get("content") or ""
+                    choice = r.json()["choices"][0]
+                    text = choice["message"].get("content") or ""
                     try:
                         return json.loads(text[text.index("{"): text.rindex("}") + 1])
                     except ValueError:
-                        last = "bad JSON: " + text[:200]
+                        last = f"{model}: bad JSON (finish={choice.get('finish_reason')}) {text[:150]!r}"
                         continue
-                last = f"{model}: {r.status_code} {r.text[:300]}"
+                last = f"{model}: {r.status_code} {r.text[:250]}"
                 if r.status_code == 429:
                     time.sleep(10)
                 if r.status_code == 404:
@@ -169,7 +178,7 @@ def translate(segs, lang, workdir):
     key = os.environ["GROQ_API_KEY"]
     models = pick_models(key)
     result = []
-    batch_size = 20
+    batch_size = 12
     for b in range(0, len(segs), batch_size):
         batch = segs[b:b + batch_size]
         items = [{"id": i, "zh": s["text"],
