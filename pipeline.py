@@ -240,47 +240,54 @@ def separate_background(video, workdir, minutes):
     return found[0]
 
 
-def mix_and_mux(video, lines, clips_dir, lang, workdir, minutes, background):
-    from pydub import AudioSegment
-    import tempfile
+RATE = 24000
 
+
+def _pcm(args):
+    r = subprocess.run(["ffmpeg", "-v", "error", *args], capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError("ffmpeg failed: " + r.stderr.decode("utf-8", "ignore")[-500:])
+    return r.stdout
+
+
+def mix_and_mux(video, lines, clips_dir, lang, workdir, minutes, background):
+    """Low-memory mixing: voice clips are written into one raw PCM file on disk (no overlap,
+    guaranteed by plan_placements), then a single ffmpeg call mixes it with the background."""
     spoken = [(i, l) for i, l in enumerate(lines) if l["dub"] and (clips_dir / f"{i:05d}.mp3").exists()]
-    clips = {i: AudioSegment.from_file(clips_dir / f"{i:05d}.mp3") for i, _ in spoken}
-    durations = [len(clips[i]) / 1000.0 for i, _ in spoken]
+    raws, durations = {}, []
+    for i, _ in spoken:
+        raw = clips_dir / f"{i:05d}.raw"
+        if not raw.exists():
+            raw.write_bytes(_pcm(["-i", str(clips_dir / f"{i:05d}.mp3"),
+                                  "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-"]))
+        raws[i] = raw
+        durations.append(raw.stat().st_size / 2 / RATE)
     plan = plan_placements([l for _, l in spoken], durations)
 
-    total_ms = int((max(l["end"] for l in lines) + 5) * 1000)
-    track = AudioSegment.silent(duration=total_ms, frame_rate=24000)
-    for (i, _), p in zip(spoken, plan):
-        clip = clips[i]
-        if p["speed"] > 1.01:
-            with tempfile.TemporaryDirectory() as td:
-                src, dst = Path(td) / "a.wav", Path(td) / "b.wav"
-                clip.export(src, format="wav")
-                run(["ffmpeg", "-y", "-i", str(src), "-filter:a", f"atempo={p['speed']:.3f}", str(dst)])
-                clip = AudioSegment.from_file(dst)
-        track = track.overlay(clip, position=int(p["start"] * 1000))
-    track = track.set_channels(2).set_frame_rate(44100)
+    dub_raw = workdir / f"dub_{lang}.raw"
+    with open(dub_raw, "wb") as f:
+        for (i, _), p in zip(spoken, plan):
+            if p["speed"] > 1.01:
+                data = _pcm(["-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", str(raws[i]),
+                             "-filter:a", f"atempo={p['speed']:.3f}",
+                             "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-"])
+            else:
+                data = raws[i].read_bytes()
+            f.seek(int(p["start"] * RATE) * 2)
+            f.write(data)
 
-    if background:
-        bg = AudioSegment.from_file(background)
-    else:
-        src_wav = workdir / "orig.wav"
-        cmd = ["ffmpeg", "-y", "-i", str(video)]
-        if minutes:
-            cmd += ["-t", str(minutes * 60)]
-        run(cmd + ["-vn", "-ac", "2", "-ar", "44100", str(src_wav)])
-        bg = AudioSegment.from_file(src_wav) - 22  # faint original under the dub
-    mixed = bg[:len(track)].overlay(track) if len(bg) >= len(track) else track.overlay(bg)
-    mix_path = workdir / f"mix_{lang}.wav"
-    mixed.export(mix_path, format="wav")
-
+    bg_src = background or video
+    bg_vol = 1.0 if background else 0.08  # faint original under the dub if no separation
     out = workdir / f"dubbed_{lang}.mp4"
-    cmd = ["ffmpeg", "-y", "-i", str(video), "-i", str(mix_path)]
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(bg_src),
+           "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", str(dub_raw),
+           "-filter_complex",
+           f"[1:a:0]aresample=44100,volume={bg_vol}[bg];[2:a]aresample=44100[fg];"
+           "[bg][fg]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[out]",
+           "-map", "0:v:0", "-map", "[out]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
     if minutes:
         cmd += ["-t", str(minutes * 60)]
-    cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)]
-    run(cmd)
+    run(cmd + [str(out)])
     return out
 
 
