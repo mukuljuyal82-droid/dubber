@@ -18,7 +18,8 @@ from pathlib import Path
 
 GROQ = "https://api.groq.com/openai/v1"
 WHISPER_MODEL = "whisper-large-v3"
-LLM_MODEL = "llama-3.3-70b-versatile"
+# Groq retired llama-3.3-70b-versatile (Aug 2026). Tried in order; only ones the account can see are used.
+LLM_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
 
 VOICES = {"hi": "hi-IN-SwaraNeural", "en": "en-US-AriaNeural"}
 LANG_NAME = {"hi": "Hindi (Devanagari script)", "en": "English"}
@@ -118,12 +119,55 @@ def transcribe(chunks, workdir):
     return segs
 
 
-def translate(segs, lang, workdir):
+def pick_models(key):
     import requests
+    try:
+        r = requests.get(f"{GROQ}/models", headers={"Authorization": f"Bearer {key}"}, timeout=30)
+        have = {m["id"] for m in r.json().get("data", [])}
+        picked = [m for m in LLM_MODELS if m in have]
+        if picked:
+            return picked
+    except Exception:
+        pass
+    return list(LLM_MODELS)
+
+
+def llm_json(prompt, key, models):
+    """Ask the LLM for JSON; falls back across models and with/without JSON mode."""
+    import requests
+    last = ""
+    for attempt in range(3):
+        for model in models:
+            for json_mode in (True, False):
+                body = {"model": model, "temperature": 0.3,
+                        "messages": [{"role": "user", "content": prompt}]}
+                if json_mode:
+                    body["response_format"] = {"type": "json_object"}
+                r = requests.post(f"{GROQ}/chat/completions",
+                                  headers={"Authorization": f"Bearer {key}"},
+                                  json=body, timeout=180)
+                if r.status_code == 200:
+                    text = r.json()["choices"][0]["message"].get("content") or ""
+                    try:
+                        return json.loads(text[text.index("{"): text.rindex("}") + 1])
+                    except ValueError:
+                        last = "bad JSON: " + text[:200]
+                        continue
+                last = f"{model}: {r.status_code} {r.text[:300]}"
+                if r.status_code == 429:
+                    time.sleep(10)
+                if r.status_code == 404:
+                    break  # model not available, try the next one
+        time.sleep(4 * (attempt + 1))
+    raise RuntimeError(f"translation failed: {last}")
+
+
+def translate(segs, lang, workdir):
     out = workdir / f"translation_{lang}.json"
     if out.exists():
         return json.loads(out.read_text(encoding="utf-8"))
     key = os.environ["GROQ_API_KEY"]
+    models = pick_models(key)
     result = []
     batch_size = 20
     for b in range(0, len(segs), batch_size):
@@ -139,26 +183,13 @@ def translate(segs, lang, workdir):
             'Return JSON only: {"items":[{"id":0,"text":"..."}]}\n\n'
             + json.dumps(items, ensure_ascii=False)
         )
+        data = llm_json(prompt, key, models)
         translated = {}
-        for attempt in range(4):
-            r = requests.post(
-                f"{GROQ}/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json={"model": LLM_MODEL, "temperature": 0.3,
-                      "response_format": {"type": "json_object"},
-                      "messages": [{"role": "user", "content": prompt}]},
-                timeout=120,
-            )
-            if r.status_code == 200:
-                try:
-                    data = json.loads(r.json()["choices"][0]["message"]["content"])
-                    translated = {int(x["id"]): x["text"].strip() for x in data["items"]}
-                    break
-                except (KeyError, ValueError, TypeError):
-                    pass
-            time.sleep(4 * (attempt + 1))
-        else:
-            raise RuntimeError(f"translation failed: {r.status_code} {r.text[:300]}")
+        for x in data.get("items", []):
+            try:
+                translated[int(x["id"])] = str(x["text"]).strip()
+            except (KeyError, ValueError, TypeError):
+                continue
         for i, s in enumerate(batch):
             result.append({**s, "dub": translated.get(i, "")})
         log(f"translated {min(b + batch_size, len(segs))}/{len(segs)} lines")
