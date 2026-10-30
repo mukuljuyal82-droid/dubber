@@ -75,7 +75,9 @@ def extract_chunks(video, workdir, minutes):
                 "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
                 "-reset_timestamps", "1", str(chunks_dir / "chunk_%03d.mp3")]
         run(cmd)
-    return sorted(chunks_dir.glob("chunk_*.mp3"))
+    chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
+    # A leftover sliver at the end can be rejected by the API; drop near-empty chunks (~<0.7s).
+    return [c for c in chunks if c.stat().st_size > 4000]
 
 
 def transcribe(chunks, workdir):
@@ -99,9 +101,14 @@ def transcribe(chunks, workdir):
                 )
             if r.status_code == 200:
                 break
+            if r.status_code == 400 and "too short" in r.text:
+                r = None  # tiny leftover chunk, nothing to transcribe
+                break
             time.sleep(5 * (attempt + 1))
         else:
             raise RuntimeError(f"transcription failed: {r.status_code} {r.text[:300]}")
+        if r is None:
+            continue
         for s in r.json().get("segments", []):
             text = s["text"].strip()
             if text:
