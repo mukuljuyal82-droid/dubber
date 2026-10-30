@@ -1,0 +1,8 @@
+requests
+edge-tts
+pydub
+fastapi
+uvicorn[standard]
+python-multipart
+# optional, for removing original voices (needs a GPU for 2-hour videos):
+# demucs
