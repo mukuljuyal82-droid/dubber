@@ -1,10 +1,14 @@
 """Chinese video -> Hindi / English dubbed video.
 
 Steps: extract audio -> Whisper (Groq) -> translate with length budget (Groq LLM)
--> TTS (edge-tts, free; swap for Azure later) -> fit clips to timeline -> mix -> mux.
+-> TTS (Cartesia if CARTESIA_API_KEY is set, else edge-tts) -> fit clips to timeline -> mix -> mux.
+
+The original Chinese voice is REMOVED from the output. Only the dubbed voice is kept
+(plus music/effects if you use --separate, which needs Demucs).
 
 Usage:
     export GROQ_API_KEY=...
+    export CARTESIA_API_KEY=...
     python pipeline.py input.mp4 --lang hi --minutes 10
 """
 import argparse
@@ -14,6 +18,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 GROQ = "https://api.groq.com/openai/v1"
@@ -21,7 +26,22 @@ WHISPER_MODEL = "whisper-large-v3"
 # Groq retired llama-3.3-70b-versatile (Aug 2026). Tried in order; only ones the account can see are used.
 LLM_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
 
+# ---- edge-tts (free fallback, used only when CARTESIA_API_KEY is missing) ----
 VOICES = {"hi": "hi-IN-SwaraNeural", "en": "en-US-AriaNeural"}
+
+# ---- Cartesia ----
+CARTESIA_URL = "https://api.cartesia.ai/tts/bytes"
+CARTESIA_MODEL = os.environ.get("CARTESIA_MODEL", "sonic-3")
+# Tried in order; the first version the API accepts is used.
+CARTESIA_VERSIONS = [v for v in (os.environ.get("CARTESIA_VERSION"), "2026-03-01", "2025-04-16") if v]
+# Voice IDs. Change them freely: browse play.cartesia.ai/voices, copy the ID, set env var
+# CARTESIA_VOICE_HI / CARTESIA_VOICE_EN (or edit here). Hindi voice MUST be a Hindi-native voice.
+CARTESIA_VOICES = {
+    "hi": os.environ.get("CARTESIA_VOICE_HI", "ac7ee4fa-25db-420d-bfff-f590d740aeb2"),
+    "en": os.environ.get("CARTESIA_VOICE_EN", "f786b574-daa5-4673-aa0c-cbe3e8534c02"),
+}
+CARTESIA_WORKERS = int(os.environ.get("CARTESIA_WORKERS", "2"))  # free plan allows few parallel requests
+
 LANG_NAME = {"hi": "Hindi (Devanagari script)", "en": "English"}
 # Rough spoken characters per second at natural speed; used as a translation length budget.
 CPS = {"hi": 13.0, "en": 15.0}
@@ -206,7 +226,57 @@ def translate(segs, lang, workdir):
     return result
 
 
-async def _tts_all(items, voice, clips_dir):
+# ---------- text to speech ----------
+def _cartesia_one(text, lang, path, key):
+    """Generate one clip with Cartesia and save it as a WAV file."""
+    import requests
+    body = {
+        "model_id": CARTESIA_MODEL,
+        "transcript": text,
+        "voice": {"mode": "id", "id": CARTESIA_VOICES[lang]},
+        "language": lang,
+        "output_format": {"container": "wav", "encoding": "pcm_s16le", "sample_rate": 24000},
+    }
+    last = ""
+    for attempt in range(5):
+        for version in CARTESIA_VERSIONS:
+            r = requests.post(
+                CARTESIA_URL,
+                headers={"X-API-Key": key, "Authorization": f"Bearer {key}",
+                         "Cartesia-Version": version, "Content-Type": "application/json"},
+                json=body, timeout=120)
+            if r.status_code == 200 and r.content:
+                path.write_bytes(r.content)
+                return
+            last = f"{r.status_code} {r.text[:300]}"
+            if r.status_code in (400, 422) and "version" in r.text.lower():
+                continue  # this API version is not accepted, try the next one
+            break
+        if "401" in last[:3] or "403" in last[:3]:
+            raise RuntimeError(f"Cartesia key rejected: {last}")
+        time.sleep(3 * (attempt + 1))  # rate limit (429) or temporary error
+    raise RuntimeError(f"Cartesia TTS failed: {last}")
+
+
+def _tts_cartesia(items, lang, clips_dir):
+    key = os.environ["CARTESIA_API_KEY"]
+
+    def one(item):
+        i, text = item
+        path = clips_dir / f"{i:05d}.wav"
+        if path.exists() and path.stat().st_size > 0:
+            return
+        _cartesia_one(text, lang, path, key)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=CARTESIA_WORKERS) as pool:
+        for _ in pool.map(one, items):
+            done += 1
+            if done % 25 == 0:
+                log(f"voice clips {done}/{len(items)}")
+
+
+async def _tts_edge(items, voice, clips_dir):
     import edge_tts
     sem = asyncio.Semaphore(6)
 
@@ -227,11 +297,15 @@ async def _tts_all(items, voice, clips_dir):
 
 
 def synthesize(lines, lang, workdir):
-    clips_dir = workdir / f"clips_{lang}"
+    use_cartesia = bool(os.environ.get("CARTESIA_API_KEY"))
+    clips_dir = workdir / f"clips_{lang}_{'cartesia' if use_cartesia else 'edge'}"
     clips_dir.mkdir(exist_ok=True)
     items = [(i, l["dub"]) for i, l in enumerate(lines) if l["dub"]]
-    log(f"generating {len(items)} voice clips")
-    asyncio.run(_tts_all(items, VOICES[lang], clips_dir))
+    log(f"generating {len(items)} voice clips with {'Cartesia' if use_cartesia else 'edge-tts'}")
+    if use_cartesia:
+        _tts_cartesia(items, lang, clips_dir)
+    else:
+        asyncio.run(_tts_edge(items, VOICES[lang], clips_dir))
     return clips_dir
 
 
@@ -259,15 +333,27 @@ def _pcm(args):
     return r.stdout
 
 
+def _clip_file(clips_dir, i):
+    for ext in (".wav", ".mp3"):
+        p = clips_dir / f"{i:05d}{ext}"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
+
+
 def mix_and_mux(video, lines, clips_dir, lang, workdir, minutes, background):
     """Low-memory mixing: voice clips are written into one raw PCM file on disk (no overlap,
-    guaranteed by plan_placements), then a single ffmpeg call mixes it with the background."""
-    spoken = [(i, l) for i, l in enumerate(lines) if l["dub"] and (clips_dir / f"{i:05d}.mp3").exists()]
+    guaranteed by plan_placements), then a single ffmpeg call builds the final audio.
+
+    The original audio track is NOT used. With a Demucs background (music/effects only) the
+    dub is mixed over it; without one, the output audio is the dubbed voice only.
+    """
+    spoken = [(i, l) for i, l in enumerate(lines) if l["dub"] and _clip_file(clips_dir, i)]
     raws, durations = {}, []
     for i, _ in spoken:
         raw = clips_dir / f"{i:05d}.raw"
         if not raw.exists():
-            raw.write_bytes(_pcm(["-i", str(clips_dir / f"{i:05d}.mp3"),
+            raw.write_bytes(_pcm(["-i", str(_clip_file(clips_dir, i)),
                                   "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-"]))
         raws[i] = raw
         durations.append(raw.stat().st_size / 2 / RATE)
@@ -285,15 +371,20 @@ def mix_and_mux(video, lines, clips_dir, lang, workdir, minutes, background):
             f.seek(int(p["start"] * RATE) * 2)
             f.write(data)
 
-    bg_src = background or video
-    bg_vol = 1.0 if background else 0.08  # faint original under the dub if no separation
     out = workdir / f"dubbed_{lang}.mp4"
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(bg_src),
-           "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", str(dub_raw),
-           "-filter_complex",
-           f"[1:a:0]aresample=44100,volume={bg_vol}[bg];[2:a]aresample=44100[fg];"
-           "[bg][fg]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[out]",
-           "-map", "0:v:0", "-map", "[out]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+    if background:
+        # music/effects (voices already removed) + dubbed voice
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(background),
+               "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", str(dub_raw),
+               "-filter_complex",
+               "[1:a:0]aresample=44100[bg];[2:a]aresample=44100[fg];"
+               "[bg][fg]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[out]"]
+    else:
+        # dubbed voice only: the original audio track is dropped completely
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video),
+               "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", str(dub_raw),
+               "-filter_complex", "[1:a]aresample=44100,alimiter=limit=0.95[out]"]
+    cmd += ["-map", "0:v:0", "-map", "[out]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
     if minutes:
         cmd += ["-t", str(minutes * 60)]
     run(cmd + [str(out)])
@@ -322,6 +413,7 @@ if __name__ == "__main__":
     ap.add_argument("--lang", choices=["hi", "en"], default="hi")
     ap.add_argument("--minutes", type=int, default=10, help="only process first N minutes (0 = all)")
     ap.add_argument("--workdir")
-    ap.add_argument("--separate", action="store_true", help="remove original voices with Demucs (slow without GPU)")
+    ap.add_argument("--separate", action="store_true",
+                    help="keep music/effects by removing only the original voices with Demucs (slow without GPU)")
     a = ap.parse_args()
     print(dub(a.video, a.lang, a.workdir, a.minutes or None, a.separate))
