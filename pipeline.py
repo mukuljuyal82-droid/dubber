@@ -32,6 +32,7 @@ LLM_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # Model names change often: the code asks the API which ones the key can use. GEMINI_MODEL forces one.
 GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "90"))  # seconds to wait for one answer before giving up
 GEMINI_SKIP = ("image", "tts", "live", "audio", "embed", "vision", "robotics", "computer", "learnlm",
                "gemma", "nano", "banana", "veo", "imagen", "native", "thinking")
 
@@ -180,9 +181,14 @@ def llm_json(prompt, key, models):
                         "messages": [{"role": "user", "content": prompt}], **extra}
                 if json_mode:
                     body["response_format"] = {"type": "json_object"}
-                r = requests.post(f"{GROQ}/chat/completions",
-                                  headers={"Authorization": f"Bearer {key}"},
-                                  json=body, timeout=180)
+                try:
+                    r = requests.post(f"{GROQ}/chat/completions",
+                                      headers={"Authorization": f"Bearer {key}"},
+                                      json=body, timeout=180)
+                except requests.RequestException as e:  # timeout / network problem: try again
+                    last = f"{model}: {type(e).__name__}"
+                    time.sleep(3)
+                    continue
                 if r.status_code == 200:
                     choice = r.json()["choices"][0]
                     text = choice["message"].get("content") or ""
@@ -239,20 +245,39 @@ def gemini_models(key):
     except Exception:
         pass
     ranked = sorted((n for n in set(names) if _gemini_rank(n)), key=_gemini_rank)
-    return ranked or list(GEMINI_FALLBACK_MODELS)
+    if not ranked:
+        return list(GEMINI_FALLBACK_MODELS)
+    # best model of each kind first (flash, flash-lite, pro): if one is slow, the next try is a different kind
+    firsts, kinds = [], set()
+    for n in ranked:
+        kind = _gemini_rank(n)[0]
+        if kind not in kinds:
+            kinds.add(kind)
+            firsts.append(n)
+    return firsts + [n for n in ranked if n not in firsts]
 
 
 def gemini_json(prompt, key, models):
     """Ask Gemini for JSON. Drops models that are unavailable or out of free quota (edits `models`)."""
     import requests
     last = ""
+    timeouts = 0
     for attempt in range(3):
         for model in list(models):
             body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
                     "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}}
-            r = requests.post(f"{GEMINI_BASE}/models/{model}:generateContent",
-                              headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                              json=body, timeout=180)
+            try:
+                r = requests.post(f"{GEMINI_BASE}/models/{model}:generateContent",
+                                  headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                                  json=body, timeout=GEMINI_TIMEOUT)
+            except requests.RequestException as e:  # timeout / network problem: never crash the video
+                last = f"{model}: no answer within {GEMINI_TIMEOUT}s ({type(e).__name__})"
+                timeouts += 1
+                if model in models:
+                    models.remove(model)  # slow or unreachable, try a different model
+                if timeouts >= 2:
+                    raise RuntimeError(f"Gemini no answer: {last}")
+                continue
             if r.status_code == 200:
                 try:
                     parts = r.json()["candidates"][0]["content"]["parts"]
@@ -297,7 +322,7 @@ def make_llm():
             except RuntimeError as e:
                 gem["fails"] += 1
                 log(f"Gemini failed ({str(e)[:150]}); using Groq for this step")
-                if gem["fails"] >= 2:
+                if gem["fails"] >= 2 or "no answer" in str(e):
                     gem["models"] = []
                     log("Gemini switched off for the rest of this video")
         return llm_json(prompt, groq_key, groq_models)
