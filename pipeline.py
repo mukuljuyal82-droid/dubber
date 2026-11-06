@@ -9,12 +9,14 @@ The original Chinese voice is REMOVED from the output. Only the dubbed voice is 
 Usage:
     export GROQ_API_KEY=...
     export CARTESIA_API_KEY=...
+    export GEMINI_API_KEY=...      # optional, better Hindi translation
     python pipeline.py input.mp4 --lang hi --minutes 10
 """
 import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -25,6 +27,13 @@ GROQ = "https://api.groq.com/openai/v1"
 WHISPER_MODEL = "whisper-large-v3"
 # Groq retired llama-3.3-70b-versatile (Aug 2026). Tried in order; only ones the account can see are used.
 LLM_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
+
+# ---- Gemini (optional). Set GEMINI_API_KEY for better translation; Groq is the automatic backup. ----
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+# Model names change often: the code asks the API which ones the key can use. GEMINI_MODEL forces one.
+GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+GEMINI_SKIP = ("image", "tts", "live", "audio", "embed", "vision", "robotics", "computer", "learnlm",
+               "gemma", "nano", "banana", "veo", "imagen", "native", "thinking")
 
 # ---- edge-tts (free fallback, used only when CARTESIA_API_KEY is missing) ----
 VOICES = {"hi": "hi-IN-SwaraNeural", "en": "en-US-AriaNeural"}
@@ -191,34 +200,229 @@ def llm_json(prompt, key, models):
     raise RuntimeError(f"translation failed: {last}")
 
 
-def translate(segs, lang, workdir):
-    out = workdir / f"translation_{lang}.json"
+# ---------- Gemini (optional: better Hindi; Groq stays as backup) ----------
+def _gemini_rank(name):
+    """Sort key for text models: stable Flash first, then Flash-Lite, then Pro; newest version first."""
+    m = re.match(r"gemini-(\d+(?:\.\d+)*)-(flash-lite|flash|pro)(.*)$", name)
+    if not m or any(w in name for w in GEMINI_SKIP):
+        return None
+    ver = tuple(int(x) for x in m.group(1).split("."))
+    ver = (ver + (0, 0, 0))[:3]
+    tier = {"flash": 0, "flash-lite": 1, "pro": 2}[m.group(2)]
+    unstable = 1 if ("preview" in m.group(3) or "exp" in m.group(3)) else 0
+    return (tier, unstable, tuple(-x for x in ver), len(m.group(3)))
+
+
+def gemini_models(key):
+    """Models this key can use, best first. Names change often, so ask the API instead of hard-coding."""
+    import requests
+    forced = os.environ.get("GEMINI_MODEL")
+    if forced:
+        return [forced]
+    names, token = [], None
+    try:
+        for _ in range(5):
+            params = {"pageSize": 200}
+            if token:
+                params["pageToken"] = token
+            r = requests.get(f"{GEMINI_BASE}/models", headers={"x-goog-api-key": key},
+                             params=params, timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            for m in data.get("models", []):
+                if "generateContent" in m.get("supportedGenerationMethods", []):
+                    names.append(m["name"].split("/", 1)[-1])
+            token = data.get("nextPageToken")
+            if not token:
+                break
+    except Exception:
+        pass
+    ranked = sorted((n for n in set(names) if _gemini_rank(n)), key=_gemini_rank)
+    return ranked or list(GEMINI_FALLBACK_MODELS)
+
+
+def gemini_json(prompt, key, models):
+    """Ask Gemini for JSON. Drops models that are unavailable or out of free quota (edits `models`)."""
+    import requests
+    last = ""
+    for attempt in range(3):
+        for model in list(models):
+            body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}}
+            r = requests.post(f"{GEMINI_BASE}/models/{model}:generateContent",
+                              headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                              json=body, timeout=180)
+            if r.status_code == 200:
+                try:
+                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                    return json.loads(text[text.index("{"): text.rindex("}") + 1])
+                except (KeyError, IndexError, ValueError, TypeError):
+                    last = f"{model}: unreadable answer {r.text[:150]!r}"
+                    continue
+            last = f"{model}: {r.status_code} {r.text[:200]}"
+            low = r.text.lower()
+            if r.status_code in (400, 401, 403) and "api key" in low:
+                raise RuntimeError(f"Gemini key rejected: {last}")
+            if r.status_code in (403, 404):
+                models.remove(model)  # this key cannot use this model
+            elif r.status_code == 429:
+                squashed = low.replace("_", "").replace(" ", "")
+                if "limit:0" in squashed or "perday" in squashed:
+                    models.remove(model)  # free quota for this model is used up
+                else:
+                    time.sleep(15)  # per-minute limit, wait a bit
+            elif r.status_code >= 500:
+                time.sleep(3 * (attempt + 1))
+        if not models:
+            break
+        time.sleep(4 * (attempt + 1))
+    raise RuntimeError(f"Gemini failed: {last}")
+
+
+def make_llm():
+    """Returns (call, label). call(prompt) -> dict. Gemini first when GEMINI_API_KEY is set; Groq is the backup."""
+    groq_key = os.environ["GROQ_API_KEY"]
+    groq_models = pick_models(groq_key)
+    gkey = os.environ.get("GEMINI_API_KEY")
+    gem = {"key": gkey, "models": gemini_models(gkey), "fails": 0} if gkey else None
+
+    def call(prompt):
+        if gem and gem["models"]:
+            try:
+                data = gemini_json(prompt, gem["key"], gem["models"])
+                gem["fails"] = 0
+                return data
+            except RuntimeError as e:
+                gem["fails"] += 1
+                log(f"Gemini failed ({str(e)[:150]}); using Groq for this step")
+                if gem["fails"] >= 2:
+                    gem["models"] = []
+                    log("Gemini switched off for the rest of this video")
+        return llm_json(prompt, groq_key, groq_models)
+
+    label = f"Gemini ({gem['models'][0]})" if gem and gem["models"] else f"Groq ({groq_models[0]})"
+    return call, label
+
+
+# ---------- translation ----------
+def _sample_text(texts, limit):
+    """Up to `limit` characters, taken evenly from the whole video (not just the start)."""
+    full = "\n".join(texts)
+    if len(full) <= limit:
+        return full
+    k = 8
+    size = limit // k
+    step = (len(full) - size) // (k - 1)
+    return "\n...\n".join(full[i * step: i * step + size] for i in range(k))
+
+
+def build_glossary(segs, lang, workdir, call, limit):
+    """One pass over the whole video: summary + one fixed rendering for every name, so names never change."""
+    out = workdir / f"glossary_{lang}.json"
     if out.exists():
         return json.loads(out.read_text(encoding="utf-8"))
-    key = os.environ["GROQ_API_KEY"]
-    models = pick_models(key)
+    prompt = (
+        "Below are Chinese subtitle lines sampled from one video.\n"
+        "1) Write a 1-2 sentence English summary: topic, story/genre, tone, who is speaking.\n"
+        "2) List the important names (people, places, groups, titles, special terms) that appear, "
+        f"each with ONE consistent rendering in {LANG_NAME[lang]} for the voiceover, written the way "
+        "a native speaker would say it aloud.\n"
+        'Return JSON only: {"summary":"...","terms":[{"zh":"...","to":"..."}]}\n\n'
+        + _sample_text([s["text"] for s in segs], limit)
+    )
+    try:
+        data = call(prompt)
+    except RuntimeError as e:
+        log(f"glossary skipped: {str(e)[:150]}")
+        return {"summary": "", "terms": []}
+    terms = []
+    for t in data.get("terms", []):
+        if isinstance(t, dict) and t.get("zh") and t.get("to"):
+            terms.append({"zh": str(t["zh"]).strip(), "to": str(t["to"]).strip()})
+    glossary = {"summary": str(data.get("summary", ""))[:600], "terms": terms[:80]}
+    out.write_text(json.dumps(glossary, ensure_ascii=False, indent=1), encoding="utf-8")
+    return glossary
+
+
+def _translate_prompt(lang, summary, terms, before, after, items):
+    parts = [
+        "You are a professional dubbing translator. Translate the Chinese subtitle lines below into "
+        f"natural, spoken {LANG_NAME[lang]} for a voiceover that a narrator reads aloud. Keep the speaker's tone."
+    ]
+    if summary:
+        parts.append(f"About the video: {summary}")
+    if terms:
+        parts.append("Always render these names/terms exactly like this: "
+                     + json.dumps(terms, ensure_ascii=False))
+    if before:
+        parts.append("Lines just before (already translated, context only, do NOT output them): "
+                     + json.dumps([{"zh": x["text"], "done": x["dub"]} for x in before], ensure_ascii=False))
+    if after:
+        parts.append("Lines just after (context only, do NOT translate): "
+                     + json.dumps([s["text"] for s in after], ensure_ascii=False))
+    rules = (
+        "Rules: translate the meaning, not word for word, and do not add or drop information. "
+        "A sentence can continue across lines, so make the lines flow one after another without "
+        "repeating words from the previous line. EVERY line must get a translation of at most max_chars "
+        "characters: shorten by rephrasing, never by cutting meaning. No notes, brackets or emoji."
+    )
+    if lang == "hi":
+        rules += " Write Hindi in Devanagari, in simple spoken language, the way a storyteller would say it."
+    parts.append(rules)
+    parts.append('Return JSON only: {"items":[{"id":0,"text":"..."}]}')
+    parts.append("Lines to translate:\n" + json.dumps(items, ensure_ascii=False))
+    return "\n\n".join(parts)
+
+
+def _parse_items(data):
+    translated = {}
+    for x in data.get("items", []):
+        try:
+            text = str(x["text"]).strip()
+            if text:
+                translated[int(x["id"])] = text
+        except (KeyError, ValueError, TypeError):
+            continue
+    return translated
+
+
+def translate(segs, lang, workdir):
+    out = workdir / f"translation_{lang}_v2.json"
+    if out.exists():
+        return json.loads(out.read_text(encoding="utf-8"))
+    call, label = make_llm()
+    log(f"translating with {label}")
+    glossary = build_glossary(segs, lang, workdir, call, 14000 if label.startswith("Gemini") else 5000)
+    log(f"glossary ready: {len(glossary['terms'])} names/terms")
     result = []
-    batch_size = 12
+    batch_size = 15
     for b in range(0, len(segs), batch_size):
         batch = segs[b:b + batch_size]
+        before = [x for x in result[-4:] if x["dub"]]
+        after = segs[b + batch_size:b + batch_size + 3]
         items = [{"id": i, "zh": s["text"],
                   "max_chars": max(8, int((s["end"] - s["start"]) * CPS[lang] * 1.25))}
                  for i, s in enumerate(batch)]
-        prompt = (
-            f"Translate these Chinese subtitle lines into natural, spoken {LANG_NAME[lang]} "
-            "for a video voiceover. Keep names consistent, keep the tone of the speaker. "
-            "Each translation MUST be at most max_chars characters, so shorten by rephrasing "
-            "rather than cutting meaning. No notes, no brackets.\n"
-            'Return JSON only: {"items":[{"id":0,"text":"..."}]}\n\n'
-            + json.dumps(items, ensure_ascii=False)
-        )
-        data = llm_json(prompt, key, models)
+        seen = " ".join(s["text"] for s in batch + before + after)
+        terms = [t for t in glossary["terms"] if t["zh"] in seen][:40]
         translated = {}
-        for x in data.get("items", []):
+        try:
+            translated = _parse_items(call(_translate_prompt(
+                lang, glossary["summary"], terms, before, after, items)))
+        except RuntimeError as e:
+            log(f"batch failed, will retry line by line: {str(e)[:150]}")
+        missing = [it for it in items if it["id"] not in translated]
+        if missing:  # the model skipped some lines: ask again for just those
             try:
-                translated[int(x["id"])] = str(x["text"]).strip()
-            except (KeyError, ValueError, TypeError):
-                continue
+                translated.update(_parse_items(call(_translate_prompt(
+                    lang, glossary["summary"], terms, [], [], missing))))
+            except RuntimeError as e:
+                log(f"retry failed: {str(e)[:150]}")
+        gaps = sum(1 for i in range(len(batch)) if i not in translated)
+        if gaps:
+            log(f"warning: {gaps} line(s) left without translation (silent gap)")
         for i, s in enumerate(batch):
             result.append({**s, "dub": translated.get(i, "")})
         log(f"translated {min(b + batch_size, len(segs))}/{len(segs)} lines")
@@ -298,7 +502,9 @@ async def _tts_edge(items, voice, clips_dir):
 
 def synthesize(lines, lang, workdir):
     use_cartesia = bool(os.environ.get("CARTESIA_API_KEY"))
-    clips_dir = workdir / f"clips_{lang}_{'cartesia' if use_cartesia else 'edge'}"
+    # the voice id is part of the folder name, so changing the voice never re-uses old clips
+    tag = f"cartesia_{CARTESIA_VOICES[lang][:8]}" if use_cartesia else "edge"
+    clips_dir = workdir / f"clips_{lang}_{tag}"
     clips_dir.mkdir(exist_ok=True)
     items = [(i, l["dub"]) for i, l in enumerate(lines) if l["dub"]]
     log(f"generating {len(items)} voice clips with {'Cartesia' if use_cartesia else 'edge-tts'}")
